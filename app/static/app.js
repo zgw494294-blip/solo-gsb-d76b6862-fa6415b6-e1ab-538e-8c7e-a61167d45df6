@@ -69,11 +69,21 @@ async function api(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json().catch(() => ({}));
+  // 可能已收到响应头（甚至 200）但正文在读取完成前中断：此时 res.json() 会因
+  // 内容不完整而拒绝。不能把这种情况吞成空对象当作成功，否则上层会按“成功但
+  // 缺字段”提交状态（清空列表、解锁下载 / 跳转），须按可恢复失败处理。
+  const data = await res.json().catch(() => null);
   if (!res.ok) {
     const err = new Error("api error");
     err.status = res.status;
-    err.errors = (data.detail && data.detail.errors) || ["请求失败"];
+    err.errors = (data && data.detail && data.detail.errors) || ["请求失败"];
+    throw err;
+  }
+  if (!data || typeof data !== "object") {
+    // 200 响应头已到达、正文却读取中断 / 无法解析：与连接失败一样可重试
+    const err = new Error("response body interrupted");
+    err.status = res.status;
+    err.errors = ["响应正文在读取完成前中断（已收到响应头但内容不完整），请检查网络后重试。"];
     throw err;
   }
   return data;
@@ -309,10 +319,30 @@ async function renderPreview(epoch, rev, seq) {
   let data;
   try {
     data = await api("/api/preview", snapshot());
+    // 只有“完整读到的有效预览”才允许提交状态：正文中断等情况下 api() 已抛错；
+    // 这里再校验响应形态，任何缺字段 / 字段形态不符的响应都按可恢复失败处理，
+    // 绝不先提交成功状态（不清空列表、不更新引用跳转与下载状态）。
+    const itemOk =
+      data &&
+      Array.isArray(data.items) &&
+      data.items.every(
+        (it) =>
+          it &&
+          typeof it.id === "string" &&
+          Number.isInteger(it.display) &&
+          typeof it.text === "string" &&
+          Array.isArray(it.broken),
+      );
+    if (!itemOk || typeof data.has_broken !== "boolean") {
+      const err = new Error("invalid preview body");
+      err.errors = ["预览响应内容不完整或无法识别，草稿已保留，请重试预览。"];
+      throw err;
+    }
   } catch (e) {
     if (seq !== previewSeq || epoch !== state.epoch || rev !== state.rev) return; // 迟到响应：丢弃
-    // 预览失败：保留当前草稿与既有 DOM，不回滚任何已完成的改动；
-    // 显示失败信息并重试/取消入口，列表与下载在预览恢复前保持锁定
+    // 预览失败（含已收到 200 响应头但正文读取中断）：保留当前草稿与既有 DOM，
+    // 不回滚任何已完成的改动，也不清空列表；显示失败信息并重试/取消入口，
+    // 列表、引用跳转、下载与合并工具栏在预览恢复前保持锁定
     state.previewFresh = false;
     state.previewError = errorList(e);
     syncToolbar();
