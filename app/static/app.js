@@ -69,11 +69,23 @@ async function api(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json().catch(() => ({}));
+  // 正文可能在读取/解析时中断（已收到 2xx 响应头但正文被截断）：
+  // 这种响应不能当作成功采用，统一归为可重试的请求失败，由各调用方按失败收尾。
+  let data;
+  try {
+    data = await res.json();
+  } catch (_) {
+    data = null;
+  }
   if (!res.ok) {
     const err = new Error("api error");
     err.status = res.status;
-    err.errors = (data.detail && data.detail.errors) || ["请求失败"];
+    err.errors = (data && data.detail && data.detail.errors) || ["请求失败"];
+    throw err;
+  }
+  if (data === null || typeof data !== "object") {
+    const err = new Error("response interrupted");
+    err.errors = ["响应正文在读取完成前中断，请重试。"];
     throw err;
   }
   return data;
@@ -295,6 +307,12 @@ async function render() {
   syncBusy();
   try {
     await renderPreview(epoch, rev, seq);
+  } catch (e) {
+    // 兜底：预览渲染过程中的任何意外都按“预览失败”收尾（而不是把假成功状态留在
+    // 页面上导致重试入口消失）。迟到响应（已重新导入 / 被新预览取代）一律丢弃。
+    if (seq === previewSeq && epoch === state.epoch && rev === state.rev) {
+      failPreview(errorList(e));
+    }
   } finally {
     // 已重新导入：旧请求（拆分/合并后的预览等）的响应与收尾一律不得改动
     // 新稿的列表、提示或按钮；在途标记由重新导入处理直接复位
@@ -305,32 +323,46 @@ async function render() {
   }
 }
 
+// 预览失败统一收尾：草稿与既有 DOM 原样保留（不回滚已完成的拆分 / 合并 / 保存、
+// 不清空旧列表），标记未追上并显示失败信息与重试入口；列表、引用跳转与下载
+// 在预览恢复前保持锁定。调用前须已确认响应仍适用于当前草稿（seq/epoch/rev）。
+function failPreview(errors) {
+  state.previewFresh = false;
+  state.previewError = errors;
+  syncToolbar();
+  syncPreviewErrorBanner();
+  syncBusy();
+}
+
 async function renderPreview(epoch, rev, seq) {
   let data;
   try {
     data = await api("/api/preview", snapshot());
   } catch (e) {
     if (seq !== previewSeq || epoch !== state.epoch || rev !== state.rev) return; // 迟到响应：丢弃
-    // 预览失败：保留当前草稿与既有 DOM，不回滚任何已完成的改动；
-    // 显示失败信息并重试/取消入口，列表与下载在预览恢复前保持锁定
-    state.previewFresh = false;
-    state.previewError = errorList(e);
-    syncToolbar();
-    syncPreviewErrorBanner();
-    syncBusy();
+    // 预览失败（服务端错误、断网，或已收到响应头但正文读取中断）：
+    // 保留当前草稿与既有 DOM，不回滚任何已完成的改动、不清空列表；
+    // 显示失败信息与重试入口，列表、引用跳转与下载在预览恢复前保持锁定。
+    failPreview(errorList(e));
     return;
   }
   // 只采用仍适用于当前草稿的响应：之后已发出更新的预览、或草稿已变化 / 已重新导入，则丢弃
   if (seq !== previewSeq || epoch !== state.epoch || rev !== state.rev) return;
-  state.preview = data;
-  state.previewFresh = true;
-  state.previewError = null;
-  state.renderedRev = rev;
-  state.renderedSplittingId = state.splittingId;
-  state.renderedEditingId = state.editingId;
+  // 响应头正常但正文可能被截断成残缺 JSON：只有结构完整、与当前草稿对应的
+  // 预览才算有效，否则按失败处理并保留旧列表与重试入口，绝不据其提交状态。
+  if (
+    !data ||
+    !Array.isArray(data.items) ||
+    data.items.length !== state.orderIds.length
+  ) {
+    failPreview(["预览响应正文不完整，请重试。"]);
+    return;
+  }
 
-  clauseList.classList.toggle("busy", state.merging || state.splitting);
-  clauseList.textContent = "";
+  // 先在离屏容器中构建全部新内容；构建期间不触碰页面 DOM、也不提交任何状态。
+  // 这样即使构建意外抛错，旧列表仍在、失败/重试入口仍可出现，不会留下“已清空
+  // 列表且重试入口消失”的假成功状态。
+  const frag = document.createDocumentFragment();
   let brokenTotal = 0;
   const brokenLines = [];
 
@@ -389,31 +421,45 @@ async function renderPreview(epoch, rev, seq) {
       </div>
       ${isEditing ? editorHtml(item) : isSplitting ? splitHtml(item) : `<div class="card-body">${bodyHtml(item)}</div>`}
     `;
-    clauseList.appendChild(li);
-  }
-
-  // 顶部状态
-  statCount.textContent = `共 ${data.items.length} 条`;
-  statBroken.hidden = brokenTotal === 0;
-  statBroken.textContent = `${brokenTotal} 处失效引用`;
-  syncToolbar();
-
-  // 失效引用横幅
-  if (brokenLines.length) {
-    brokenBanner.hidden = false;
-    brokenBanner.innerHTML =
-      `<strong>存在失效引用，修复前禁止下载。</strong>请编辑下列条款，把失效标记改为有效的 [[当前编号]]，或删除该标记：<ul>${brokenLines.join(
-        "",
-      )}</ul>`;
-  } else {
-    brokenBanner.hidden = true;
-    brokenBanner.textContent = "";
+    frag.appendChild(li);
   }
 
   // 纯文本预览：直接用服务端解析出的 text 拼装，与 /api/export 完全同一逻辑
   const plain = data.items.map((it) => `${it.display}|${it.text}`).join("\n");
+
+  // 失效引用横幅内容
+  const brokenHtml = brokenLines.length
+    ? `<strong>存在失效引用，修复前禁止下载。</strong>请编辑下列条款，把失效标记改为有效的 [[当前编号]]，或删除该标记：<ul>${brokenLines.join(
+        "",
+      )}</ul>`
+    : "";
+
+  // 新内容已就绪：先替换页面 DOM（不会再抛错），随后一次性提交状态。
+  // 只有读到与当前草稿一致的有效预览后，列表 / 引用跳转 / 下载状态才更新；
+  // 此前的任何中断都不会清空旧列表或解禁下载与同步工具栏。
+  clauseList.textContent = "";
+  clauseList.appendChild(frag);
+  statCount.textContent = `共 ${data.items.length} 条`;
+  statBroken.hidden = brokenTotal === 0;
+  statBroken.textContent = `${brokenTotal} 处失效引用`;
+  if (brokenLines.length) {
+    brokenBanner.hidden = false;
+    brokenBanner.innerHTML = brokenHtml;
+  } else {
+    brokenBanner.hidden = true;
+    brokenBanner.textContent = "";
+  }
   previewText.textContent = plain;
   previewText.classList.toggle("blocked", data.has_broken);
+
+  state.preview = data;
+  state.previewFresh = true;
+  state.previewError = null;
+  state.renderedRev = rev;
+  state.renderedSplittingId = state.splittingId;
+  state.renderedEditingId = state.editingId;
+  clauseList.classList.toggle("busy", state.merging || state.splitting);
+  syncToolbar();
 
   // 拆分选择器打开时，按当前状态恢复其分界选中态与按钮可用态
   if (state.splittingId) {
