@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>条款重排校稿台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>条款重排校稿台</h1>
+    <p class="subtitle">粘贴“编号|正文”导入 · 重排 / 合并 / 拆分 / 删除后引用始终绑定原条款 · 修复全部失效引用后才能下载</p>
+  </header>
+
+  <main>
+    <!-- 导入区 -->
+    <section id="import-panel" class="panel">
+      <h2>导入</h2>
+      <p class="hint">
+        每行一条，格式为 <code>编号|正文</code>，编号从 1 连续排列，共 2～40 行；
+        正文用 <code>[[编号]]</code> 显式引用其他条款（如 <code>[[3]]</code>，编号两侧不可有空格）。
+        任何格式错误、编号重复或引用无目标都会导致<strong>整份拒收</strong>。
+      </p>
+      <textarea id="import-text" rows="10" placeholder="1|甲方应在七日内交付设备。&#10;2|乙方按 [[1]] 验收后付款。&#10;3|争议解决方式见 [[4]]。&#10;4|因本合同产生的争议提交仲裁。"></textarea>
+      <div class="row">
+        <button id="import-btn" class="primary">导入</button>
+        <button id="sample-btn" type="button">填入示例</button>
+      </div>
+      <ul id="import-errors" class="errors" hidden></ul>
+    </section>
+
+    <!-- 校稿台 -->
+    <section id="desk" hidden>
+      <div class="panel toolbar">
+        <div class="toolbar-left">
+          <strong id="stat-count"></strong>
+          <span id="stat-broken" class="broken-pill" hidden></span>
+          <span class="muted">（刷新页面将丢弃草稿）</span>
+        </div>
+        <div class="toolbar-right">
+          <button id="merge-btn" disabled>合并所选</button>
+          <button id="reimport-btn">重新导入</button>
+          <button id="download-btn" class="primary" disabled>下载纯文本</button>
+        </div>
+      </div>
+
+      <div id="broken-banner" class="panel banner" hidden></div>
+
+      <!-- 预览失败横幅：草稿保留、列表暂停操作，提供重试预览及取消拆分/编辑入口 -->
+      <div id="preview-error-banner" class="panel banner preview-error" hidden></div>
+
+      <div class="columns">
+        <div class="panel">
+          <h2>条款列表</h2>
+          <p class="hint">用 ↑↓ 或拖拽 ⠿ 调整顺序；勾选两条不同条款后点「合并所选」可按当前显示顺序合并；点「拆分」可在选定分界处把一条已保存正文拆成前后两条（原指向本条的引用可选落前段或后段）；编号为当前显示编号，引用始终指向导入时绑定的条款。</p>
+          <ol id="clause-list" class="clause-list"></ol>
+        </div>
+
+        <div class="panel">
+          <h2>纯文本预览（与下载内容一致）</h2>
+          <pre id="preview-text" class="preview"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
